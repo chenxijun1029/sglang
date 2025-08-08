@@ -26,6 +26,15 @@ def pack_interleave(num_experts, ref_weight, ref_scale):
     w_q = weight.view((num_experts, n, k // 2)).view(torch.int8)
     w_q = w_q.contiguous()
 
+    pad_len = (-ref_scale.size(2)) % 4  # 0–3
+    if pad_len:
+        pad = torch.zeros(
+            (*ref_scale.shape[:2], pad_len),
+            dtype=ref_scale.dtype,
+            device=ref_scale.device,
+        )
+        ref_scale = torch.cat([ref_scale, pad], dim=2)
+
     scale_interleaved = ref_scale.reshape(
         ref_scale.shape[0], ref_scale.shape[1], (ref_scale.shape[2] // 4), 4
     )  # [E, N, K/4, 4]
@@ -128,8 +137,8 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
 
 
 @pytest.mark.parametrize("batch_size", [2, 4, 8, 16])
-@pytest.mark.parametrize("k", [512, 1024])
-@pytest.mark.parametrize("n", [1024, 2048])
+@pytest.mark.parametrize("k", [256, 512, 1024])
+@pytest.mark.parametrize("n", [1024, 2048, 7168])
 @pytest.mark.parametrize("num_experts", [2, 4, 6, 8])
 def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts):
     torch.manual_seed(0)
