@@ -490,7 +490,7 @@ class W4AFp8TPMoEMethod(FusedMoEMethodBase):
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        return cutlass_w4a8_moe(
+        output = cutlass_w4a8_moe(
             start_expert_id=0,
             end_expert_id=self.num_experts - 1,
             total_num_experts=self.num_experts,
@@ -517,3 +517,6 @@ class W4AFp8TPMoEMethod(FusedMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
+        if routed_scaling_factor is not None:
+            output = output * routed_scaling_factor
+        return output
