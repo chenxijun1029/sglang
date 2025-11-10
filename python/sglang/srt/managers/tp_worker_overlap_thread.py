@@ -17,8 +17,9 @@ import dataclasses
 import logging
 import signal
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from queue import Queue
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import psutil
 import torch
@@ -70,7 +71,7 @@ class TpModelWorkerClient:
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
         self.gpu_id = gpu_id
-
+        
         # Init future mappings
         self.future_token_ids_ct = 0
         self.future_token_ids_limit = self.max_running_requests * 3
@@ -91,7 +92,24 @@ class TpModelWorkerClient:
         if self.device == "cpu":
             self.scheduler_stream.synchronize = lambda: None  # No-op for CPU
 
+        # Confidential compute mode
+        self.enable_confidential_compute_optimize = getattr(
+            server_args, "enable_confidential_compute_optimize", False
+        )
+
+        # Host copy thread pool (for confidential compute mode)
+        if self.enable_confidential_compute_optimize and self.device != "cpu":
+            self.host_copy_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="host_copy"
+            )
+            logger.info(
+                f"Confidential compute mode enabled: GPU->CPU copies will use worker thread"
+            )
+        else:
+            self.host_copy_executor = None
+
         self.hicache_layer_transfer_counter = None
+
 
     def register_hicache_layer_transfer_counter(self, counter):
         self.hicache_layer_transfer_counter = counter
@@ -134,6 +152,44 @@ class TpModelWorkerClient:
 
     def get_kv_cache(self):
         return self.worker.model_runner.token_to_kv_pool
+
+    def host_copy_thread_active(self) -> bool:
+        """Check if the host copy thread pool is active."""
+        return self.host_copy_executor is not None
+
+    def _to_host_tensor(
+        self, tensor: torch.Tensor, copy_ready: Optional[torch.cuda.Event] = None
+    ) -> torch.Tensor:
+        if copy_ready is not None:
+            # Confidential compute mode: synchronize then blocking copy.
+            # synchronize() is intentionally chosen instead of wait() here; 
+            # otherwise, the blocking copy will stall subsequent CUDA API 
+            # calls on the main thread
+            copy_ready.synchronize()
+            return tensor.to("cpu", non_blocking=False)
+        else:
+            # Standard mode: async copy
+            return tensor.to("cpu", non_blocking=True)
+
+    def _copy_tensor_to_host(
+        self, 
+        tensor: torch.Tensor,
+        copy_ready: Optional[torch.cuda.Event] = None
+    ) -> Union[torch.Tensor, Future[torch.Tensor]]:
+        """Copy a tensor to host, either directly or via worker thread."""
+        if self.host_copy_thread_active():
+            # Confidential compute mode: offload to worker thread
+            # Record an event on the main stream that we will synchronize with 
+            # on the worker thread
+            if copy_ready is None:
+                copy_ready = torch.cuda.Event()
+                copy_ready.record()
+            return self.host_copy_executor.submit(
+                self._to_host_tensor, tensor, copy_ready=copy_ready
+            )
+        else:
+            # Standard mode: direct copy
+            return self._to_host_tensor(tensor, copy_ready=None)
 
     def forward_thread_func(self):
         try:
@@ -185,20 +241,31 @@ class TpModelWorkerClient:
             ] = next_token_ids
 
             # Copy results to the CPU
+            copy_ready = None # Prepare copy_ready event for confidential compute mode
+            if self.host_copy_thread_active():
+                copy_ready = torch.cuda.Event()
+                copy_ready.record()
+                copy_done = None  # No need for copy_done event in confidential mode
+        
+            next_token_ids = self._copy_tensor_to_host(next_token_ids, copy_ready)
+            
             if model_worker_batch.return_logprob:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                logits_output.next_token_logprobs = self._copy_tensor_to_host(
+                    logits_output.next_token_logprobs, copy_ready
                 )
                 if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = (
-                        logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                    logits_output.input_token_logprobs = self._copy_tensor_to_host(
+                        logits_output.input_token_logprobs, copy_ready
                     )
+            
             if logits_output.hidden_states is not None:
-                logits_output.hidden_states = logits_output.hidden_states.to(
-                    "cpu", non_blocking=True
+                logits_output.hidden_states = self._copy_tensor_to_host(
+                    logits_output.hidden_states, copy_ready
                 )
-            next_token_ids = next_token_ids.to("cpu", non_blocking=True)
-            copy_done.record()
+            
+            # Record event for standard mode
+            if not self.host_copy_thread_active():
+                copy_done.record()
 
             self.output_queue.put(
                 (copy_done, logits_output, next_token_ids, can_run_cuda_graph)
@@ -215,7 +282,31 @@ class TpModelWorkerClient:
 
         if launch_done is not None:
             launch_done.wait()
-        copy_done.synchronize()
+            
+        # Resolve copies based on mode
+        if self.host_copy_thread_active():
+            # Confidential compute mode: wait for Futures to complete
+            # The synchronization happens in the worker thread
+            if isinstance(next_token_ids, Future):
+                next_token_ids = next_token_ids.result()
+                
+            if logits_output.next_token_logprobs is not None:
+                if isinstance(logits_output.next_token_logprobs, Future):
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs.result()
+                    )
+                if logits_output.input_token_logprobs is not None:
+                    if isinstance(logits_output.input_token_logprobs, Future):
+                        logits_output.input_token_logprobs = (
+                            logits_output.input_token_logprobs.result()
+                        )
+                        
+            if logits_output.hidden_states is not None:
+                if isinstance(logits_output.hidden_states, Future):
+                    logits_output.hidden_states = logits_output.hidden_states.result()
+        else:
+            # Standard mode: synchronize with CUDA event
+            copy_done.synchronize()
 
         if logits_output.next_token_logprobs is not None:
             logits_output.next_token_logprobs = (
@@ -292,5 +383,11 @@ class TpModelWorkerClient:
         return self.worker.can_run_lora_batch(lora_ids)
 
     def __delete__(self):
-        self.input_queue.put((None, None))
-        self.copy_queue.put((None, None, None))
+        """Cleanup resources on deletion."""
+        # Signal forward thread to exit
+        self.input_queue.put((None, None, None))
+        
+        # Shutdown host copy executor if active
+        if self.host_copy_executor is not None:
+            self.host_copy_executor.shutdown(wait=True)
+            logger.info("Host copy executor shut down")
